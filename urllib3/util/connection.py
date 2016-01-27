@@ -1,4 +1,6 @@
 from __future__ import absolute_import
+import errno
+import select
 import socket
 try:
     from select import poll, POLLIN
@@ -64,6 +66,7 @@ def create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
     if host.startswith('['):
         host = host.strip('[]')
     err = None
+    socks = []
     for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
         af, socktype, proto, canonname, sa = res
         sock = None
@@ -74,18 +77,66 @@ def create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
             # This is the only addition urllib3 makes to this function.
             _set_socket_options(sock, socket_options)
 
-            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
-                sock.settimeout(timeout)
+            #if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+            #    sock.settimeout(timeout)
+
+            # Put the socket into non-blocking mode.
+            sock.settimeout(0.0)
             if source_address:
                 sock.bind(source_address)
-            sock.connect(sa)
-            return sock
+
+            code = sock.connect_ex(sa)
+            assert code
+            if code != errno.EINPROGRESS:
+                raise socket.error(code)
+            socks.append(sock)
+            #return sock
 
         except socket.error as e:
             err = e
             if sock is not None:
                 sock.close()
                 sock = None
+
+    # Check whether any connects have returned. Their return will be marked by
+    # being writeable.
+    found = None
+    while socks:
+        print socks
+        _, s, _ = select.select([], socks, [], timeout if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT else None)
+        print s
+        if not s:
+            err = RuntimeError("Timed out connecting all sockets")
+            for sock in socks:
+                sock.close()
+            break
+
+        for sock in s:
+            socks.remove(sock)
+            if found is not None:
+                sock.close()
+                continue
+
+            connect_error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if connect_error:
+                sock.close()
+                err = RuntimeError("connect error %d" % connect_error)
+                continue
+
+            found = sock
+
+        if found is None:
+            continue
+
+        found.settimeout(timeout)
+        break
+
+    for sock in socks:
+        sock.close()
+
+    if found:
+        print found.getpeername()
+        return found
 
     if err is not None:
         raise err
